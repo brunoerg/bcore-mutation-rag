@@ -1,0 +1,33 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Pipeline outputs (regenerable)
+runs/
+data/*index*/
+mutants.json
+patches/
+
+# Secrets
+.env
+.env.*
+
+# Editors / OS
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+.DS_Store
