@@ -4,7 +4,8 @@ import pytest
 
 from mutant_rag.claude_cli import (ClaudeCLIError, ClaudeCodeClient, ClaudeConfig, ClaudeNotFoundError,
                                    ClaudeTimeoutError)
-from mutant_rag.generation import MUTANT_SCHEMA, build_prompt, generate, make_unified_diff, postprocess
+from mutant_rag.generation import (MUTANT_SCHEMA, build_prompt, generate, make_unified_diff, postprocess,
+                                  strip_logging)
 from mutant_rag.retrieval import RetrievedBug
 from mutant_rag.target import load_target
 
@@ -142,6 +143,46 @@ def test_postprocess_statuses(target, examples, target_repo):
         if m.status == "candidate":
             subprocess.run(["git", "-C", str(target_repo), "apply", "--check", "-"], input=m.patch,
                            text=True, check=True)
+
+
+LOGGING_SRC = """void CTxMemPool::Trim(size_t limit)
+{
+    if (DynamicMemoryUsage() > limit) {
+        LogDebug(BCLog::MEMPOOL, "trimming %u bytes (limit=%u)\\n",
+                 DynamicMemoryUsage(), limit);
+        RemoveWorst();
+    }
+    LogPrintf("done; size=%d\\n", size());
+    std::cout << "x" << limit << std::endl;
+}
+"""
+
+
+def test_prompt_forbids_logging_mutants(target, examples):
+    assert "Do NOT mutate logging" in build_prompt(target, examples, 3, 2)
+
+
+def test_strip_logging_handles_multiline_calls_and_literals():
+    code = 'a(); LogPrintf("x;)\\"(", f(1, (2)));\n  b(); // LogPrintf(\nWalletLogPrintf("%s",\n s);c();'
+    assert strip_logging(code) == "a(); \n  b(); \nc();"
+    assert strip_logging("std::cerr << f(\";\") << x;\ny();") == "\ny();"
+    assert strip_logging("foo.printf(1); MyLog(2);") == "foo.printf(1); MyLog(2);"
+
+
+def test_postprocess_rejects_logging_only(make_repo, examples):
+    repo = make_repo({"src/txmempool.cpp": LOGGING_SRC})
+    target = load_target(repo / "src/txmempool.cpp")
+    ok = examples[0].record.id
+    raw = [
+        mut('LogPrintf("done; size=%d\\n", size());', 'LogPrintf("done; size=%d\\n", size() + 1);', [ok]),
+        mut('                 DynamicMemoryUsage(), limit);', '                 limit, DynamicMemoryUsage());', [ok]),
+        mut('    LogPrintf("done; size=%d\\n", size());\n', '', [ok]),  # deleting a log line
+        mut('    std::cout << "x" << limit << std::endl;', '    std::cout << "y" << std::endl;', [ok]),
+        mut("        RemoveWorst();", '        LogPrintf("skip\\n");', [ok]),  # replaces logic: kept
+        mut("    if (DynamicMemoryUsage() > limit) {", "    if (DynamicMemoryUsage() >= limit) {", [ok]),
+    ]
+    got = [m.reject_reason or m.status for m in postprocess(raw, target, examples, max_changed_lines=2)]
+    assert got == ["logging_only"] * 4 + ["candidate", "candidate"]
 
 
 def test_unified_diff_without_trailing_newline(make_repo):
