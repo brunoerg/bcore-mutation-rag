@@ -205,7 +205,10 @@ def _retrieve(args, rec: prov.RunRecorder):
     embedder = make_embedder(args.embedder or idx.embedder_name)
     retriever = Retriever(idx, embedder)
     flt = RetrievalFilter(subsystems=args.subsystem or (), exclude_commits=args.exclude_commit or ())
-    results = retriever.search(Query(target.code, target.function_name, target.subsystem), args.top_k, flt)
+    # With --line, a target too long to embed whole is embedded around that line.
+    focus_line = args.line - target.start_line if args.line else None
+    results = retriever.search(Query(target.code, target.function_name, target.subsystem, focus_line),
+                               args.top_k, flt)
     base_commit = prov.git_head(target.repo) if target.repo else None
     dirty = False
     if target.repo:

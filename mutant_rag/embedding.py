@@ -9,18 +9,23 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Protocol, Sequence
+from dataclasses import dataclass
+from typing import Callable, Protocol, Sequence
 
 import numpy as np
 
+from .chunking import changed_lines, compact_diff, focus_code, take_lines
 from .records import BugRecord
 
 DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 # Bump when the text fed to the embedder changes; stored in the index manifest so
 # a stale index is detected instead of silently mixing representations.
-TEXT_FORMAT_VERSION = 1
-MAX_CODE_CHARS = 4000
+TEXT_FORMAT_VERSION = 2
+# Input budget for embedders that don't report one (HashingEmbedder, test doubles).
+DEFAULT_MAX_CHARS = 6000
+# Share of the budget the fix diff may use; the focused buggy code gets the rest.
+DIFF_SHARE = 1 / 3
 
 
 class Embedder(Protocol):
@@ -32,28 +37,57 @@ class Embedder(Protocol):
         ...
 
 
-def record_text(r: BugRecord) -> str:
+@dataclass(frozen=True)
+class TextBudget:
+    """How much text an embedder actually reads: `measure(text) <= limit`."""
+    measure: Callable[[str], int]
+    limit: int
+
+    def fits(self, text: str, share: float = 1.0) -> bool:
+        return self.measure(text) <= int(self.limit * share)
+
+
+def text_budget(embedder: object | None) -> TextBudget:
+    budget = getattr(embedder, "text_budget", None)
+    return budget() if callable(budget) else TextBudget(len, DEFAULT_MAX_CHARS)
+
+
+def _header(subsystem: str, function_name: str, subject: str = "") -> str:
+    head = f"// subsystem: {subsystem}\n" if subsystem else ""
+    head += f"// function: {function_name}\n" if function_name else ""
+    head += f"// fix: {subject}\n" if subject else ""
+    return head
+
+
+def record_text(r: BugRecord, budget: TextBudget | None = None) -> str:
     """Text representation of a historical bug used for indexing.
 
     The buggy code dominates so that a *target function* (code only) lands near
     historical bugs with similar code; the subject and diff add the bug pattern.
+    When the whole function does not fit the embedder's input, the code is
+    narrowed to the signature plus the lines around the fix (see `chunking`).
     """
-    return (
-        f"// subsystem: {r.subsystem}\n"
-        f"// function: {r.function_name}\n"
-        f"// fix: {r.subject}\n"
-        f"{r.buggy_code[:MAX_CODE_CHARS]}\n"
-        f"// diff:\n{r.diff[:MAX_CODE_CHARS // 2]}"
-    )
+    budget = budget or text_budget(None)
+    head = _header(r.subsystem, r.function_name, r.subject)
+    diff_lines = compact_diff(r.diff)
+    diff_fits = lambda d: budget.fits(f"{head}// diff:\n{d}", DIFF_SHARE)  # noqa: E731
+    if not diff_fits("\n".join(diff_lines)):
+        # The removed lines are already in the code window; keep the fix itself.
+        diff_lines = [l for l in diff_lines if l.startswith("+")] or diff_lines
+    diff = take_lines(diff_lines, lambda t: budget.fits(t, DIFF_SHARE), lambda d: f"{head}// diff:\n{d}")
+    wrap = lambda code: f"{head}{code}\n// diff:\n{diff}"  # noqa: E731
+    return wrap(focus_code(r.buggy_code, changed_lines(r.buggy_code, r.fixed_code), budget.fits, wrap))
 
 
-def query_text(code: str, function_name: str = "", subsystem: str = "") -> str:
-    head = ""
-    if subsystem:
-        head += f"// subsystem: {subsystem}\n"
-    if function_name:
-        head += f"// function: {function_name}\n"
-    return head + code[:MAX_CODE_CHARS]
+def query_text(code: str, function_name: str = "", subsystem: str = "",
+               focus_line: int | None = None, budget: TextBudget | None = None) -> str:
+    """Text for a target function. `focus_line` (0-based, within `code`) centers the
+    window when the function is too long to embed whole; otherwise it is embedded
+    from the top and the embedder cuts the tail."""
+    budget = budget or text_budget(None)
+    head = _header(subsystem, function_name)
+    focus = [focus_line] if focus_line is not None else []
+    return head + focus_code(code, focus, budget.fits, lambda c: head + c)
 
 
 def _normalize(x: np.ndarray) -> np.ndarray:
@@ -87,6 +121,12 @@ class SentenceTransformerEmbedder:
             normalize_embeddings=True, show_progress_bar=False,
         )
         return _normalize(vecs)
+
+    def text_budget(self) -> TextBudget:
+        tok = self._model.tokenizer
+        # Count with special tokens: the model's limit includes [CLS] and [SEP].
+        return TextBudget(lambda t: len(tok(t, add_special_tokens=True, verbose=False)["input_ids"]),
+                          int(self._model.max_seq_length))
 
 
 _TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+|==|!=|<=|>=|&&|\|\||<<|>>|[-+*/%<>=!&|^~]")
