@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol, Sequence
 
-from .embedding import Embedder, query_text
+from .embedding import Embedder, query_text, text_budget
 from .index import BugIndex
 from .records import BugRecord
 
@@ -27,6 +27,7 @@ class Query:
     code: str
     function_name: str = ""
     subsystem: str = ""  # used for the query text only; filtering uses `subsystems`
+    focus_line: int | None = None  # 0-based line within `code` to center on if it is too long to embed
 
 
 @dataclass
@@ -97,7 +98,8 @@ class Retriever:
 
     def search(self, query: Query, top_k: int = 5, flt: RetrievalFilter | None = None) -> list[RetrievedBug]:
         flt = flt or RetrievalFilter()
-        qvec = self.embedder.encode([query_text(query.code, query.function_name, query.subsystem)])
+        qvec = self.embedder.encode([query_text(query.code, query.function_name, query.subsystem,
+                                                query.focus_line, text_budget(self.embedder))])
         # A flat index is exact, so when filtering we can afford to score everything;
         # this guarantees filtered results are the true top-k within the subset.
         n = len(self.index) if (flt.is_active() or self.rerankers) else top_k * self.oversample

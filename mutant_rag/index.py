@@ -22,7 +22,7 @@ from typing import Iterable
 import faiss
 import numpy as np
 
-from .embedding import TEXT_FORMAT_VERSION, Embedder, record_text
+from .embedding import TEXT_FORMAT_VERSION, Embedder, record_text, text_budget
 from .records import BugRecord
 
 INDEX_FILE = "index.faiss"
@@ -134,7 +134,8 @@ class BugIndex:
             for fid in stale:
                 del self.entries[fid]
         if to_embed:
-            vecs = embedder.encode([record_text(r) for r in to_embed])
+            budget = text_budget(embedder)
+            vecs = embedder.encode([record_text(r, budget) for r in to_embed])
             ids = np.arange(self._next_id, self._next_id + len(to_embed), dtype=np.int64)
             self._next_id += len(to_embed)
             self.faiss.add_with_ids(vecs, ids)

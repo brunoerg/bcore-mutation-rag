@@ -76,6 +76,8 @@ python -m mutant_rag validate --input mutants.json \
 
 `--file` must identify one function. Pass `--function NAME` or `--line N` when the file defines
 several. A file with exactly one function, or with no recognizable function at all, is used as-is.
+With `--line`, a target too long for the embedder's input is embedded around that line instead of
+from its first line (Claude still gets the whole function).
 
 ### Mining heuristics: why "fix" is not enough
 
@@ -161,6 +163,15 @@ rather than silently mixed in.
 **Embeddings**: the default is `sentence-transformers/all-MiniLM-L6-v2` on CPU, which is
 deterministic. Override the model with `--embedder` and the device with `MUTANT_RAG_DEVICE`.
 `--embedder hashing-512` is an offline feature-hashing baseline used by tests.
+
+**Focused chunking**: the model reads only 256 tokens, and most Bitcoin Core functions are
+longer, so embedding a whole function would keep just its signature and first statements.
+Each record's embedded text is therefore built to fit the model's token budget, in this order:
+header (subsystem, function, fix subject), then the function's signature plus the lines the fix
+changed and as much surrounding context as fits (with `// ...` where lines were left out), then
+the fix's removed/added lines, using at most a third of the budget. When the full diff doesn't
+fit, only the added lines are kept. Functions that fit are embedded whole. The stored record and
+the Claude prompt always use the full function. See `chunking.py`.
 
 **Retrieval** runs in stages: dense top-N → filters (subsystem, label, excluded commits) →
 `Reranker`s → top-k. A `Reranker` is any object with
@@ -277,7 +288,8 @@ mutant_rag/
   mining.py      git mining + candidate heuristics
   triage.py      Claude-assisted pre-classification of candidates
   labeling.py    interactive / scripted manual validation, review queues, agreement stats
-  embedding.py   sentence-transformers + hashing embedders, record/query text
+  chunking.py    focused chunking: narrows long functions to the changed lines for embedding
+  embedding.py   sentence-transformers + hashing embedders, token budgets, record/query text
   index.py       FAISS index + metadata + manifest, incremental upsert
   retrieval.py   Retriever, filters, Reranker protocol
   target.py      target function loading (repo/relpath/subsystem detection)
