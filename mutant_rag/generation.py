@@ -17,7 +17,7 @@ from .claude_cli import ClaudeCodeClient
 from .retrieval import RetrievedBug
 from .target import Target
 
-PROMPT_VERSION = 1
+PROMPT_VERSION = 2
 MAX_EXAMPLE_DIFF_CHARS = 3000
 
 SYSTEM_PROMPT = """\
@@ -61,8 +61,12 @@ def build_prompt(target: Target, examples: list[RetrievedBug], n_mutants: int, m
         "# Requirements\n\n"
         f"1. Localized: each mutant changes at most {max_changed_lines} contiguous lines, inside the target function only.\n"
         "2. Behavior-changing: the mutant must change runtime behavior for some reachable input. "
-        "Do NOT produce refactorings, renamings, comment/whitespace/logging-only changes, or edits "
+        "Do NOT produce refactorings, renamings, comment/whitespace-only changes, or edits "
         "you believe are semantically equivalent.\n"
+        "   Do NOT mutate logging or printing: leave LogPrintf/LogPrint/LogInfo/LogDebug/LogTrace/"
+        "LogWarning/LogError/LogPrintLevel/WalletLogPrintf calls, printf/fprintf, and std::cout/std::cerr "
+        "output untouched (their format strings, arguments, and whether they run). Log output is not "
+        "tested, so such mutants are useless. Target the surrounding program logic instead.\n"
         "3. Must still compile: keep types, names and syntax valid C++.\n"
         "4. `original_snippet` must be copied VERBATIM from the target function (including indentation) "
         "and must occur exactly once in it. Prefer whole lines.\n"
@@ -195,6 +199,8 @@ def postprocess(raw_mutants: list[dict], target: Target, examples: list[Retrieve
                 m.status, m.reject_reason = "rejected", "no_change"
             elif _normalize_ws(new_func) == _normalize_ws(func):
                 m.status, m.reject_reason = "rejected", "whitespace_only"
+            elif _normalize_ws(strip_logging(new_func)) == _normalize_ws(strip_logging(func)):
+                m.status, m.reject_reason = "rejected", "logging_only"
             elif m.changed_lines > max_changed_lines:
                 m.status, m.reject_reason = "rejected", f"not_localized ({m.changed_lines} lines changed)"
             elif m.patch in seen_patches:
@@ -211,9 +217,62 @@ def postprocess(raw_mutants: list[dict], target: Target, examples: list[Retrieve
     return out
 
 
+# Statements whose only effect is log/console output. Bitcoin Core's tests don't assert on
+# these, so mutants confined to them survive without telling us anything about test quality.
+_LOG_CALL_RE = re.compile(
+    r"\b(?:\w+::)*(?:Wallet)?Log(?:Printf|Print|PrintLevel|PrintfCategory|Info|Debug|Trace|Warning|Error)"
+    r"(?:RateLimited)?\s*\("
+    r"|(?<![\w.>:])(?:std::)?(?:printf|fprintf|puts)\s*\("
+)
+_COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
+_STREAM_RE = re.compile(r"\bstd::(?:cout|cerr|clog)\b")
+
+
+def _skip_literal(s: str, i: int) -> int:
+    """i points at a quote; return the index just past the closing quote."""
+    q, i = s[i], i + 1
+    while i < len(s) and s[i] != q:
+        i += 2 if s[i] == "\\" else 1
+    return i + 1
+
+
+def _statement_end(s: str, i: int, paren_depth: int) -> int:
+    """Scan from i to the end of the statement (the ';' after parens close), skipping literals."""
+    depth = paren_depth
+    while i < len(s):
+        c = s[i]
+        if c in "\"'":
+            i = _skip_literal(s, i)
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth < 0:  # unbalanced: stop here rather than eat the enclosing code
+                return i
+        elif c == ";" and depth <= 0:
+            return i + 1
+        i += 1
+    return i
+
+
+def strip_logging(code: str) -> str:
+    """Remove logging/printing statements so changes confined to them compare equal."""
+    code = _COMMENT_RE.sub("", code)
+    out, i = [], 0
+    while True:
+        m1, m2 = _LOG_CALL_RE.search(code, i), _STREAM_RE.search(code, i)
+        m = min((x for x in (m1, m2) if x), key=lambda x: x.start(), default=None)
+        if m is None:
+            out.append(code[i:])
+            return "".join(out)
+        out.append(code[i:m.start()])
+        i = _statement_end(code, m.end(), 1 if m.re is _LOG_CALL_RE else 0)
+
+
 def _normalize_ws(s: str) -> str:
     # Remove comments and collapse whitespace: catches comment/whitespace-only "mutants".
-    s = re.sub(r"//[^\n]*|/\*.*?\*/", "", s, flags=re.S)
+    s = _COMMENT_RE.sub("", s)
     return re.sub(r"\s+", "", s)
 
 

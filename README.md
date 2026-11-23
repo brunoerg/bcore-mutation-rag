@@ -186,7 +186,9 @@ locates the snippet inside the target function and builds the unified diff itsel
 `difflib` against the exact file bytes. Exact matches are tried first, then a
 whitespace-insensitive match with re-indentation. Candidates are rejected and kept with a
 `reject_reason` when the snippet is not found or is ambiguous, the change is a no-op or
-comment/whitespace-only, it exceeds `--max-changed-lines` (default 3), it duplicates another
+comment/whitespace-only, it only touches logging/printing statements (`LogPrintf`, `LogDebug`,
+`LogInfo`, …, `printf`, `std::cout`/`std::cerr`; log output isn't tested, so these mutants are
+noise, and the prompt also tells Claude not to produce them), it exceeds `--max-changed-lines` (default 3), it duplicates another
 mutant, or it cites no retrieved historical bug.
 
 **Validation** never touches the main checkout. It creates `git worktree add --detach` worktrees
