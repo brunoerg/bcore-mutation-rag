@@ -199,3 +199,17 @@ def test_generate_with_fake_cli_does_not_touch_repo(fake_claude, target, example
     assert [m.status for m in res.mutants] == ["candidate"]
     assert res.prompt == fake_claude.last_call()["prompt"]
     assert git(target_repo, "status", "--porcelain") == ""
+
+
+def test_resolve_bug_id_accepts_unambiguous_short_forms():
+    from mutant_rag.generation import resolve_bug_id
+    known = {"ad9e86dca11d:src/txmempool.cpp:CTxMemPool::remove": "ad9e86dca11d0000",
+             "bc013fe8e3d0:src/txmempool.cpp:CTxMemPool::CheckPackageLimits": "bc013fe8e3d00000",
+             "bc013fe8e3d0:src/txmempool.cpp:CTxMemPool::removeConflicts": "bc013fe8e3d00000"}
+    full = "ad9e86dca11d:src/txmempool.cpp:CTxMemPool::remove"
+    assert resolve_bug_id(full, known) == full
+    assert resolve_bug_id("ad9e86dca11d", known) == full          # commit prefix only
+    assert resolve_bug_id("`ad9e86d`", known) == full             # shorter prefix, backticks
+    assert resolve_bug_id("CTxMemPool::remove", known) == full    # function suffix
+    assert resolve_bug_id("bc013fe8e3d0", known) == "bc013fe8e3d0"  # ambiguous: two functions, same commit
+    assert resolve_bug_id("ad9e", known) == "ad9e"                # too short to trust

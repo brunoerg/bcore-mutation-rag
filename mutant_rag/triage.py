@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
-from .claude_cli import ClaudeCLIError, ClaudeCodeClient
+from .llm import CLIClient, LLMError
 from .records import TRIAGE_VERDICTS, BugRecord
 
 TRIAGE_PROMPT_VERSION = 1
@@ -129,7 +129,7 @@ def apply_results(batch: list[BugRecord], results: list[dict], model: str, run_i
     return applied, [i for i in by_id if i not in applied]
 
 
-def triage(records: Iterable[BugRecord], client: ClaudeCodeClient, run_id: str, batch_size: int = 5,
+def triage(records: Iterable[BugRecord], client: CLIClient, run_id: str, batch_size: int = 5,
            on_batch: Callable[[BatchOutcome], None] | None = None) -> list[BatchOutcome]:
     """Triage records in batches, mutating their triage_* fields.
 
@@ -149,7 +149,7 @@ def triage(records: Iterable[BugRecord], client: ClaudeCodeClient, run_id: str, 
             model = ",".join(resp.models_used) or model_label
             results = resp.structured.get("results", []) if isinstance(resp.structured, dict) else []
             out.applied, out.missing = apply_results(batch, results, model, run_id)
-        except ClaudeCLIError as e:
+        except LLMError as e:
             out.error, out.missing = f"{type(e).__name__}: {e}", out.record_ids
         outcomes.append(out)
         if on_batch:

@@ -1,8 +1,8 @@
 # mutant_rag — historical-bug-based mutation testing for Bitcoin Core
 
 Given a C++ function from Bitcoin Core, `mutant_rag` retrieves similar
-**historical bug fixes** from the project's git history. It then asks Claude Code
-to generate **realistic mutants** that re-introduce analogous faults. Each mutant
+**historical bug fixes** from the project's git history. It then asks an LLM (through the
+Claude Code, Codex or opencode CLI) to generate **realistic mutants** that re-introduce analogous faults. Each mutant
 is a unified diff with an explanation and the historical commits that inspired it.
 A separate stage applies, compiles and tests mutants in throwaway git worktrees.
 
@@ -11,7 +11,7 @@ git history ──mine──▶ candidates.jsonl ──label──▶ confirmed 
                                                                                │
 target.cpp ─────────────────────────────────────────────search (top-k)◀────────┘
      │                                                       │
-     └──────────────▶ prompt ──claude -p (no tools)──▶ snippets ──▶ patches (difflib)
+     └──────────────▶ prompt ──agent CLI (no tools)──▶ snippets ──▶ patches (difflib)
                                                                         │
                                        validate: git worktree → apply → build → tests
 ```
@@ -23,10 +23,24 @@ python3 -m venv .venv
 .venv/bin/pip install -e '.[test]'      # sentence-transformers, faiss-cpu, numpy, pytest
 ```
 
-You also need the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) installed and logged in
-(`claude` on `PATH`). No API key is needed. Your Claude Code subscription login is used, and
-`ANTHROPIC_API_KEY` is removed from the child environment by default, so a key left in your shell
-won't silently switch billing.
+You also need one agent CLI installed and logged in. Pick it with `--backend` on `triage` and
+`generate`:
+
+| `--backend` | CLI | `--model` examples | notes |
+|---|---|---|---|
+| `claude` (default) | [Claude Code](https://docs.claude.com/en/docs/claude-code) | `haiku`, `sonnet`, `opus` | subscription login; `ANTHROPIC_API_KEY` is removed from the child env |
+| `codex` | [Codex CLI](https://github.com/openai/codex) | `gpt-5.5` (what your account allows) | ChatGPT login; `OPENAI_API_KEY`/`CODEX_API_KEY` are removed from the child env |
+| `opencode` | [opencode](https://opencode.ai) | `openrouter/deepseek/deepseek-v3.2`, `opencode/gpt-5.4-nano` (`opencode models` lists them) | any provider configured in opencode (`opencode auth list`), so cheap and local models work too |
+
+`--model` defaults to the CLI's own default, `--effort` maps to `--effort` (claude),
+`model_reasoning_effort` (codex) or `--variant` (opencode), and `--llm-bin` points to a
+non-default executable (`--claude-bin` still works).
+
+```bash
+python -m mutant_rag generate --backend opencode --model openrouter/deepseek/deepseek-v3.2 \
+       --file ~/src/bitcoin/src/txmempool.cpp --function TrimToSize --out mutants.json
+python -m mutant_rag triage --backend codex --batch-size 5 --limit 50
+```
 
 ## Quick start (synthetic data, ~1 minute)
 
@@ -64,9 +78,9 @@ python -m mutant_rag index --triage-min-confidence 0.8  # + unreviewed records C
 python -m mutant_rag search --file ~/src/bitcoin/src/txmempool.cpp --function TrimToSize --top-k 5 \
        [--subsystem mempool --subsystem validation] [--exclude-commit <sha>]
 
-# 6. Generate mutants (calls `claude -p`; nothing in the repo is modified)
+# 6. Generate mutants (calls the agent CLI; nothing in the repo is modified)
 python -m mutant_rag generate --file ~/src/bitcoin/src/txmempool.cpp --function TrimToSize \
-       --top-k 5 --n-mutants 5 [--model opus] [--dry-run] --out mutants.json
+       --top-k 5 --n-mutants 5 [--backend opencode --model provider/model] [--dry-run] --out mutants.json
 
 # 7. Validate in temporary worktrees
 python -m mutant_rag validate --input mutants.json \
@@ -99,7 +113,7 @@ overwrites existing records, so manual labels are preserved.
 
 ### Triage: Claude-assisted labeling
 
-`triage` sends unreviewed candidates to `claude -p` in batches (`--batch-size`, default 5),
+`triage` sends unreviewed candidates to the selected backend in batches (`--batch-size`, default 5),
 using the same tool-less, sandboxed invocation as generation. For each candidate Claude returns:
 
 * `verdict`: `bug_fix`, `not_bug_fix` or `uncertain`, judged against explicit criteria
@@ -180,7 +194,8 @@ the Claude prompt always use the full function. See `chunking.py`.
 without changing callers, and every stage's score is saved. Use `--exclude-commit` to hold out
 the commit a target was taken from when evaluating.
 
-**Claude Code integration** (`claude_cli.py`) runs:
+**LLM backends** (`llm.py`) share one contract: `run_json(prompt, schema, system_prompt)` returns
+a schema-valid JSON object or raises a typed `LLMError`. **Claude Code** (`claude_cli.py`) runs:
 
 ```
 claude -p --output-format json --json-schema <schema> --tools "" --strict-mcp-config \
@@ -191,6 +206,24 @@ The prompt goes in on stdin, and the CLI runs in a fresh empty temp directory. W
 no MCP and no repo cwd, the model cannot read or modify Bitcoin Core. The schema-validated
 object is read from `structured_output`. Non-zero exits, `is_error` results, non-JSON output
 and timeouts raise typed errors, and the CLI's stdout/stderr are saved in the run directory.
+
+**Codex** (`codex_cli.py`) runs `codex exec --json --ephemeral --skip-git-repo-check --sandbox
+read-only --disable shell_tool -c web_search="disabled" -c mcp_servers={} --output-schema <file> -`
+in the same kind of empty temp directory. Codex enforces the schema; the reply is the last
+`agent_message` of the JSONL event stream. The system prompt is placed before the user prompt.
+A snap-packaged codex has a private `/tmp` and can't read the schema file there: set `TMPDIR` to a
+non-hidden directory under your home, or install codex with npm.
+
+**opencode** (`opencode_cli.py`) runs `opencode run --format json --pure --agent mutant-rag
+--title mutant-rag [--model provider/model] [--variant E]`. The `mutant-rag` agent is injected
+through `OPENCODE_CONFIG_CONTENT` (merged with your config): its prompt is our system prompt,
+replacing opencode's long coding-agent prompt, all its tools are disabled and every permission
+is denied. opencode has no structured-output flag, so the JSON Schema is appended to the prompt,
+and the reply is parsed leniently (code fences and surrounding prose are tolerated) and checked
+against the schema (`llm.check_schema`). The per-call cost and token counts opencode reports are
+saved in `llm_response.json`. opencode retries provider errors such as rate limits or an
+exhausted free quota instead of exiting, so they show up as timeouts; rerun the saved argv with
+`--print-logs` to see the cause.
 
 **Patches**: Claude returns `original_snippet` → `mutated_snippet` pairs, not diffs. The tool
 locates the snippet inside the target function and builds the unified diff itself with
@@ -228,13 +261,13 @@ Every command writes `runs/<UTC-timestamp>_<command>_<id>/`:
 | `triage_meta.json`, `batches/*`, `triage_summary.json` | triage config, system prompt, schema, CLI version; per-batch prompt + raw response |
 | `target.json` | target file/function/lines, code, sha256, repo base commit, dirty flag |
 | `retrieval.json` | index manifest, embedder, filter, ranked results with per-stage scores and SHAs |
-| `prompt.txt` | exact prompt sent to Claude |
-| `generation_meta.json` | system prompt, JSON schema, Claude config and argv, `claude --version`, models used, prompt sha256 |
-| `claude_response.json` | raw CLI JSON response |
+| `prompt.txt` | exact prompt sent to the LLM |
+| `generation_meta.json` | system prompt, JSON schema, backend config (`llm_config`) and argv, CLI `--version`, models used, prompt sha256 |
+| `llm_response.json` | raw CLI response (JSON, or parsed JSONL events for codex/opencode) |
 | `mutants.json`, `patches/*.patch` | all candidates, including rejected ones with reasons |
 | `validation.json`, `logs/<mutant>/*.log` | per-mutant outcomes, full build/test logs, baseline, checkout fingerprint check |
 
-Seeds (`--seed`, default 1337) are applied to Python, NumPy and torch. Claude Code exposes no
+Seeds (`--seed`, default 1337) are applied to Python, NumPy and torch. None of the agent CLIs expose a
 sampling seed, so generation is **not** bit-reproducible. The exact prompt and raw response are
 archived instead.
 
@@ -286,14 +319,17 @@ mutant_rag/
   records.py     BugRecord schema, JSONL I/O, label constants
   cpp.py         C++ function extraction, subsystem mapping
   mining.py      git mining + candidate heuristics
-  triage.py      Claude-assisted pre-classification of candidates
+  triage.py      LLM-assisted pre-classification of candidates
   labeling.py    interactive / scripted manual validation, review queues, agreement stats
   chunking.py    focused chunking: narrows long functions to the changed lines for embedding
   embedding.py   sentence-transformers + hashing embedders, token budgets, record/query text
   index.py       FAISS index + metadata + manifest, incremental upsert
   retrieval.py   Retriever, filters, Reranker protocol
   target.py      target function loading (repo/relpath/subsystem detection)
-  claude_cli.py  `claude -p` subprocess wrapper
+  llm.py         backend-neutral LLM client base, errors, JSON/schema helpers
+  claude_cli.py  `claude -p` backend
+  codex_cli.py   `codex exec` backend
+  opencode_cli.py `opencode run` backend
   generation.py  prompt, JSON schema, snippet→patch post-processing
   validation.py  worktree-based apply/build/test
   provenance.py  run directories, seeds, environment snapshot

@@ -16,63 +16,24 @@ Design choices:
 from __future__ import annotations
 
 import json
-import os
-import shutil
 import subprocess
-import tempfile
-import time
-from dataclasses import asdict, dataclass, field
-from typing import Any
+
+from .llm import CLIClient, LLMConfig, LLMError, LLMNotFoundError, LLMResponse, LLMTimeoutError
+
+# Backwards-compatible names.
+ClaudeCLIError = LLMError
+ClaudeTimeoutError = LLMTimeoutError
+ClaudeNotFoundError = LLMNotFoundError
+ClaudeResponse = LLMResponse
 
 
-class ClaudeCLIError(RuntimeError):
-    """The CLI ran but failed (non-zero exit, error result, or unparseable output)."""
-
-    def __init__(self, message: str, *, returncode: int | None = None, stdout: str = "", stderr: str = ""):
-        super().__init__(message)
-        self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
+def ClaudeConfig(**kw) -> LLMConfig:  # noqa: N802 - kept for callers/tests
+    return LLMConfig(backend="claude", **kw)
 
 
-class ClaudeTimeoutError(ClaudeCLIError):
-    pass
-
-
-class ClaudeNotFoundError(ClaudeCLIError):
-    pass
-
-
-@dataclass
-class ClaudeConfig:
-    binary: str = "claude"
-    model: str | None = None  # None -> CLI default; record the resolved model from the response
-    timeout_s: float = 300.0
-    effort: str | None = None
-    max_budget_usd: float | None = None  # only meaningful for API billing; ignored by subscription
-    strip_api_key: bool = True
-    extra_args: list[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class ClaudeResponse:
-    structured: Any
-    raw: dict
-    argv: list[str]
-    duration_s: float
-    models_used: list[str]
-
-    def to_dict(self) -> dict:
-        return {"structured": self.structured, "raw": self.raw, "argv": self.argv,
-                "duration_s": self.duration_s, "models_used": self.models_used}
-
-
-class ClaudeCodeClient:
-    def __init__(self, config: ClaudeConfig | None = None):
-        self.config = config or ClaudeConfig()
+class ClaudeCodeClient(CLIClient):
+    name = "claude"
+    api_key_env = ("ANTHROPIC_API_KEY",)
 
     def build_argv(self, json_schema: dict, system_prompt: str | None = None) -> list[str]:
         c = self.config
@@ -95,52 +56,21 @@ class ClaudeCodeClient:
             argv += ["--append-system-prompt", system_prompt]
         return argv + list(c.extra_args)
 
-    def _env(self) -> dict[str, str]:
-        env = dict(os.environ)
-        if self.config.strip_api_key:
-            env.pop("ANTHROPIC_API_KEY", None)
-        return env
+    def prepare(self, sandbox, prompt, json_schema, system_prompt):
+        return self.build_argv(json_schema, system_prompt), prompt, self._env()
 
-    def version(self) -> str:
-        try:
-            out = subprocess.run([self.config.binary, "--version"], capture_output=True, text=True,
-                                 timeout=30, env=self._env())
-            return out.stdout.strip() or out.stderr.strip()
-        except (OSError, subprocess.TimeoutExpired) as e:
-            return f"unavailable ({e})"
-
-    def run_json(self, prompt: str, json_schema: dict, system_prompt: str | None = None) -> ClaudeResponse:
-        if shutil.which(self.config.binary) is None and not os.path.exists(self.config.binary):
-            raise ClaudeNotFoundError(f"Claude Code CLI not found: {self.config.binary!r}")
-        argv = self.build_argv(json_schema, system_prompt)
-        start = time.monotonic()
-        with tempfile.TemporaryDirectory(prefix="mutant_rag_claude_") as sandbox:
-            try:
-                proc = subprocess.run(
-                    argv, input=prompt, capture_output=True, text=True,
-                    timeout=self.config.timeout_s, cwd=sandbox, env=self._env(),
-                )
-            except subprocess.TimeoutExpired as e:
-                raise ClaudeTimeoutError(
-                    f"claude -p timed out after {self.config.timeout_s}s",
-                    stdout=_s(e.stdout), stderr=_s(e.stderr),
-                ) from e
-            except OSError as e:
-                raise ClaudeNotFoundError(f"failed to execute {argv[0]!r}: {e}") from e
-        duration = time.monotonic() - start
-        return self._parse(proc, argv, duration)
-
-    def _parse(self, proc: subprocess.CompletedProcess, argv: list[str], duration: float) -> ClaudeResponse:
+    def parse(self, proc: subprocess.CompletedProcess, argv: list[str], duration: float,
+              json_schema: dict) -> LLMResponse:
         try:
             raw = json.loads(proc.stdout)
         except json.JSONDecodeError:
-            raise ClaudeCLIError(
+            raise LLMError(
                 f"claude exited {proc.returncode} with non-JSON output: {proc.stdout[:500]!r} "
                 f"stderr={proc.stderr[:500]!r}",
                 returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr,
             ) from None
         if proc.returncode != 0 or raw.get("is_error") or raw.get("subtype") not in (None, "success"):
-            raise ClaudeCLIError(
+            raise LLMError(
                 f"claude failed (exit {proc.returncode}, subtype={raw.get('subtype')!r}): "
                 f"{str(raw.get('result', ''))[:500]}",
                 returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr,
@@ -151,12 +81,7 @@ class ClaudeCodeClient:
             try:
                 structured = json.loads(raw.get("result", ""))
             except (json.JSONDecodeError, TypeError):
-                raise ClaudeCLIError("response has no structured_output and result is not JSON",
-                                     returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr) from None
-        return ClaudeResponse(structured, raw, argv, duration, sorted((raw.get("modelUsage") or {}).keys()))
+                raise LLMError("response has no structured_output and result is not JSON",
+                             returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr) from None
+        return LLMResponse(structured, raw, argv, duration, sorted((raw.get("modelUsage") or {}).keys()))
 
-
-def _s(b: bytes | str | None) -> str:
-    if b is None:
-        return ""
-    return b.decode("utf-8", "replace") if isinstance(b, bytes) else b

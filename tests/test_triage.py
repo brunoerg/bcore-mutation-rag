@@ -61,7 +61,7 @@ def test_triage_batches_and_survives_failed_batch(unreviewed, fake_claude, monke
     outs = triage(unreviewed, ClaudeCodeClient(ClaudeConfig()), "run", batch_size=3, on_batch=seen.append)
     assert len(calls) == 3 and len(seen) == 3  # 8 records / 3 per batch
     assert [len(o.applied) for o in outs] == [3, 0, 2]
-    assert "ClaudeTimeoutError" in outs[1].error and len(outs[1].missing) == 3
+    assert "TimeoutError" in outs[1].error and len(outs[1].missing) == 3
     assert sum(bool(r.triage_verdict) for r in unreviewed) == 5
 
 

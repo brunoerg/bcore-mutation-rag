@@ -13,11 +13,11 @@ import hashlib
 import re
 from dataclasses import asdict, dataclass, field
 
-from .claude_cli import ClaudeCodeClient
+from .llm import CLIClient
 from .retrieval import RetrievedBug
 from .target import Target
 
-PROMPT_VERSION = 2
+PROMPT_VERSION = 3
 MAX_EXAMPLE_DIFF_CHARS = 3000
 
 SYSTEM_PROMPT = """\
@@ -42,7 +42,7 @@ MUTANT_SCHEMA = {
                     "mutated_snippet": {"type": "string", "description": "Replacement text for original_snippet."},
                     "explanation": {"type": "string"},
                     "historical_bug_ids": {"type": "array", "items": {"type": "string"},
-                                           "description": "IDs of the historical bugs (from the examples) that inspired this mutant."},
+                                           "description": "Full IDs (commit:path:function, copied exactly) of the historical bugs that inspired this mutant."},
                     "bug_pattern": {"type": "string", "description": "Short name of the fault pattern, e.g. off-by-one, missing lock, wrong comparison."},
                     "expected_behavior_change": {"type": "string", "description": "Concrete observable behavior that differs from the original."},
                 },
@@ -70,7 +70,9 @@ def build_prompt(target: Target, examples: list[RetrievedBug], n_mutants: int, m
         "3. Must still compile: keep types, names and syntax valid C++.\n"
         "4. `original_snippet` must be copied VERBATIM from the target function (including indentation) "
         "and must occur exactly once in it. Prefer whole lines.\n"
-        "5. Cite the historical bug IDs that inspired each mutant; explain the analogy in `explanation`.\n"
+        "5. Cite the historical bug IDs that inspired each mutant, copying each full ID exactly as written "
+        "after `Historical bug ID:` (commit:path:function, not just the commit hash); explain the analogy in "
+        "`explanation`.\n"
         "6. Prefer realistic faults (boundary conditions, missing checks, wrong operator, wrong variable, "
         "missing lock, incorrect state update, integer overflow) over arbitrary changes. Do not output "
         "duplicate mutants.\n",
@@ -167,6 +169,23 @@ def _changed_lines(old: str, new: str) -> int:
     return sum(max(i2 - i1, j2 - j1) for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != "equal")
 
 
+def resolve_bug_id(cited: str, known: dict[str, str]) -> str:
+    """Map a cited ID to a retrieved record ID.
+
+    Weaker models often shorten `sha:path:function` to the commit prefix (or
+    drop the path). Accept a citation that is a prefix of exactly one known
+    ID, or equals the function suffix of exactly one; otherwise keep it as-is
+    so it is reported in `unknown_bug_ids`.
+    """
+    cited = cited.strip().strip("`")
+    if cited in known:
+        return cited
+    if not cited:
+        return cited
+    hits = [k for k in known if (len(cited) >= 7 and k.startswith(cited)) or k.endswith(":" + cited)]
+    return hits[0] if len(hits) == 1 else cited
+
+
 def postprocess(raw_mutants: list[dict], target: Target, examples: list[RetrievedBug],
                 max_changed_lines: int) -> list[Mutant]:
     known = {ex.record.id: ex.record.commit_sha for ex in examples}
@@ -179,7 +198,7 @@ def postprocess(raw_mutants: list[dict], target: Target, examples: list[Retrieve
             original_snippet=rm.get("original_snippet", ""), mutated_snippet=rm.get("mutated_snippet", ""),
             explanation=rm.get("explanation", ""), bug_pattern=rm.get("bug_pattern", ""),
             expected_behavior_change=rm.get("expected_behavior_change", ""),
-            historical_bug_ids=list(rm.get("historical_bug_ids", [])),
+            historical_bug_ids=[resolve_bug_id(str(b), known) for b in rm.get("historical_bug_ids", [])],
         )
         m.historical_commits = [known[b] for b in m.historical_bug_ids if b in known]
         m.unknown_bug_ids = [b for b in m.historical_bug_ids if b not in known]
@@ -280,10 +299,10 @@ def _normalize_ws(s: str) -> str:
 class GenerationResult:
     prompt: str
     mutants: list[Mutant]
-    response: dict  # ClaudeResponse.to_dict()
+    response: dict  # LLMResponse.to_dict()
 
 
-def generate(target: Target, examples: list[RetrievedBug], client: ClaudeCodeClient,
+def generate(target: Target, examples: list[RetrievedBug], client: CLIClient,
              n_mutants: int = 5, max_changed_lines: int = 3) -> GenerationResult:
     prompt = build_prompt(target, examples, n_mutants, max_changed_lines)
     resp = client.run_json(prompt, MUTANT_SCHEMA, system_prompt=SYSTEM_PROMPT)

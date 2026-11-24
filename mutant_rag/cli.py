@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from . import provenance as prov
+from .llm import BACKENDS
 from .records import CONFIRMED, LABELS, is_indexable, load_records, merge_records, write_jsonl
 
 DEFAULT_DATASET = "data/bugs.jsonl"
@@ -130,10 +131,16 @@ def cmd_index(args) -> int:
     return 0
 
 
+def _llm_config(args):
+    from .llm import LLMConfig
+    return LLMConfig(backend=args.backend, binary=args.llm_bin, model=args.model, timeout_s=args.timeout,
+                     effort=args.effort)
+
+
 # ---- triage -----------------------------------------------------------------
 
 def cmd_triage(args) -> int:
-    from .claude_cli import ClaudeCodeClient, ClaudeConfig
+    from .llm import make_client
     from .labeling import label_stats
     from .records import UNREVIEWED
     from .triage import TRIAGE_PROMPT_VERSION, TRIAGE_SCHEMA, TRIAGE_SYSTEM, build_triage_prompt, triage
@@ -149,11 +156,11 @@ def cmd_triage(args) -> int:
         print("nothing to triage (all unreviewed records already triaged; use --redo to re-run)")
         return 0
     rec = _start_run(args, "triage")
-    cfg = ClaudeConfig(binary=args.claude_bin, model=args.model, timeout_s=args.timeout, effort=args.effort)
-    client = ClaudeCodeClient(cfg)
+    cfg = _llm_config(args)
+    client = make_client(cfg)
     rec.save_json("triage_meta.json", {
-        "prompt_version": TRIAGE_PROMPT_VERSION, "batch_size": args.batch_size, "claude_config": cfg.to_dict(),
-        "claude_cli_version": client.version(), "system_prompt": TRIAGE_SYSTEM, "json_schema": TRIAGE_SCHEMA,
+        "prompt_version": TRIAGE_PROMPT_VERSION, "batch_size": args.batch_size, "llm_config": cfg.to_dict(),
+        "llm_cli_version": client.version(), "system_prompt": TRIAGE_SYSTEM, "json_schema": TRIAGE_SCHEMA,
         "record_ids": [r.id for r in todo],
     })
     if args.dry_run:
@@ -247,7 +254,7 @@ def cmd_search(args) -> int:
 
 
 def cmd_generate(args) -> int:
-    from .claude_cli import ClaudeCLIError, ClaudeCodeClient, ClaudeConfig
+    from .llm import LLMError, make_client
     from .generation import MUTANT_SCHEMA, PROMPT_VERSION, SYSTEM_PROMPT, build_prompt, generate
 
     rec = _start_run(args, "generate")
@@ -256,13 +263,13 @@ def cmd_generate(args) -> int:
     if not results:
         _eprint("no historical bugs retrieved; is the index empty or the filter too strict?")
         return 1
-    cfg = ClaudeConfig(binary=args.claude_bin, model=args.model, timeout_s=args.timeout, effort=args.effort)
-    client = ClaudeCodeClient(cfg)
+    cfg = _llm_config(args)
+    client = make_client(cfg)
     gen_meta = {"prompt_version": PROMPT_VERSION, "n_mutants": args.n_mutants,
-                "max_changed_lines": args.max_changed_lines, "claude_config": cfg.to_dict(),
-                "claude_cli_version": client.version(), "system_prompt": SYSTEM_PROMPT,
+                "max_changed_lines": args.max_changed_lines, "llm_config": cfg.to_dict(),
+                "llm_cli_version": client.version(), "system_prompt": SYSTEM_PROMPT,
                 "json_schema": MUTANT_SCHEMA, "seed": args.seed,
-                "seed_note": "Claude Code exposes no sampling seed; generation is not bit-reproducible. "
+                "seed_note": "The agent CLIs expose no sampling seed; generation is not bit-reproducible. "
                              "The exact prompt and raw response are saved instead."}
     if args.dry_run:
         prompt = build_prompt(target, results, args.n_mutants, args.max_changed_lines)
@@ -273,14 +280,14 @@ def cmd_generate(args) -> int:
         return 0
     try:
         gen = generate(target, results, client, args.n_mutants, args.max_changed_lines)
-    except ClaudeCLIError as e:
-        rec.save_json("claude_error.json", {"error": str(e), "type": type(e).__name__, "returncode": e.returncode,
+    except LLMError as e:
+        rec.save_json("llm_error.json", {"error": str(e), "type": type(e).__name__, "returncode": e.returncode,
                                             "stdout": e.stdout[-20000:], "stderr": e.stderr[-20000:]})
         _finish_run(rec, error=str(e))
         _eprint(f"generation failed: {e} (details in {rec.dir})")
         return 1
     rec.save_text("prompt.txt", gen.prompt)
-    rec.save_json("claude_response.json", gen.response)
+    rec.save_json("llm_response.json", gen.response)
     gen_meta.update(prompt_sha256=prov.sha256_text(gen.prompt), models_used=gen.response["models_used"],
                     duration_s=gen.response["duration_s"], argv=gen.response["argv"])
     rec.save_json("generation_meta.json", gen_meta)
@@ -387,18 +394,27 @@ def build_parser() -> argparse.ArgumentParser:
                     help="show Claude's verdict while reviewing (default: yes, except in audit)")
     lb.set_defaults(func=cmd_label)
 
-    tr = sub.add_parser("triage", parents=[common], help="pre-classify unreviewed candidates with Claude Code")
+    def llm_args(sp):
+        sp.add_argument("--backend", choices=BACKENDS, default="claude",
+                        help="agent CLI used as the LLM (default claude)")
+        sp.add_argument("--model", help="model for the backend (default: the CLI's default). claude: alias or id "
+                                        "(haiku, sonnet...); codex: e.g. gpt-5.5; opencode: provider/model, "
+                                        "e.g. openrouter/deepseek/deepseek-v3.2")
+        sp.add_argument("--effort", help="reasoning effort. claude: low..max; codex: minimal..xhigh; "
+                                         "opencode: provider variant (e.g. high, minimal)")
+        sp.add_argument("--timeout", type=float, default=300.0, help="seconds per LLM call")
+        sp.add_argument("--llm-bin", "--claude-bin", dest="llm_bin",
+                        help="path to the backend executable (default: claude, codex or opencode on PATH)")
+
+    tr = sub.add_parser("triage", parents=[common], help="pre-classify unreviewed candidates with an LLM (claude/codex/opencode)")
     tr.add_argument("--dataset", default=DEFAULT_DATASET)
-    tr.add_argument("--batch-size", type=int, default=5, help="candidates per claude call")
+    tr.add_argument("--batch-size", type=int, default=5, help="candidates per LLM call")
     tr.add_argument("--limit", type=int, help="triage at most N records (highest heuristic score first)")
     tr.add_argument("--min-score", type=float)
     tr.add_argument("--subsystem")
     tr.add_argument("--redo", action="store_true", help="re-triage records that already have a verdict")
-    tr.add_argument("--model", help="Claude Code model alias or id (default: CLI default)")
-    tr.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
-    tr.add_argument("--timeout", type=float, default=300.0)
-    tr.add_argument("--claude-bin", default="claude")
-    tr.add_argument("--dry-run", action="store_true", help="save the first prompt without calling Claude")
+    llm_args(tr)
+    tr.add_argument("--dry-run", action="store_true", help="save the first prompt without calling the LLM")
     tr.set_defaults(func=cmd_triage)
 
     ix = sub.add_parser("index", parents=[common], help="embed records and build/update the FAISS index")
@@ -430,16 +446,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_search)
 
-    g = sub.add_parser("generate", parents=[common], help="generate mutants with Claude Code")
+    g = sub.add_parser("generate", parents=[common], help="generate mutants with an LLM (claude/codex/opencode)")
     target_args(g)
     g.add_argument("--n-mutants", type=int, default=5)
     g.add_argument("--max-changed-lines", type=int, default=3)
-    g.add_argument("--model", help="Claude Code model alias or id (default: CLI default)")
-    g.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
-    g.add_argument("--timeout", type=float, default=300.0)
-    g.add_argument("--claude-bin", default="claude")
+    llm_args(g)
     g.add_argument("--out", help="also write mutants JSON here")
-    g.add_argument("--dry-run", action="store_true", help="build and save the prompt without calling Claude")
+    g.add_argument("--dry-run", action="store_true", help="build and save the prompt without calling the LLM")
     g.set_defaults(func=cmd_generate)
 
     v = sub.add_parser("validate", parents=[common], help="apply, build and test mutants in temporary worktrees")
