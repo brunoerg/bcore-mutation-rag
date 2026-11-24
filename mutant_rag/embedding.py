@@ -14,7 +14,7 @@ from typing import Callable, Protocol, Sequence
 
 import numpy as np
 
-from .chunking import changed_lines, compact_diff, focus_code, take_lines
+from .chunking import changed_lines, chunk_code, compact_diff, focus_code, take_lines
 from .records import BugRecord
 
 DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -88,6 +88,22 @@ def query_text(code: str, function_name: str = "", subsystem: str = "",
     head = _header(subsystem, function_name)
     focus = [focus_line] if focus_line is not None else []
     return head + focus_code(code, focus, budget.fits, lambda c: head + c)
+
+
+def query_texts(code: str, function_name: str = "", subsystem: str = "",
+                focus_line: int | None = None, budget: TextBudget | None = None) -> list[str]:
+    """One or more query texts for a target function.
+
+    When `focus_line` is given, returns a single window focused around that line.
+    Otherwise, if the function exceeds the embedder's budget, splits it into
+    overlapping chunks (each carrying the header and function signature) so the
+    tail of a long target function is not silently dropped.
+    """
+    if focus_line is not None:
+        return [query_text(code, function_name, subsystem, focus_line, budget)]
+    budget = budget or text_budget(None)
+    head = _header(subsystem, function_name)
+    return [head + c for c in chunk_code(code, budget.fits, lambda c: head + c)]
 
 
 def _normalize(x: np.ndarray) -> np.ndarray:

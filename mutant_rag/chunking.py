@@ -20,7 +20,8 @@ import difflib
 from typing import Callable, Iterable, Sequence
 
 ELISION = "// ..."
-MAX_SIGNATURE_LINES = 4
+MAX_SIGNATURE_LINES = 12
+DEFAULT_OVERLAP_RATIO = 0.25
 
 # Returns True when the text fits the embedder's input window.
 Fits = Callable[[str], bool]
@@ -116,3 +117,50 @@ def take_lines(lines: Sequence[str], fits: Fits, wrap: Callable[[str], str]) -> 
             break
         taken.append(line)
     return "\n".join(taken)
+
+
+def chunk_code(
+    code: str,
+    fits: Fits,
+    wrap: Callable[[str], str] = lambda s: s,
+    overlap_ratio: float = DEFAULT_OVERLAP_RATIO,
+) -> list[str]:
+    """Split `code` into overlapping chunks that each fit `fits(wrap(chunk))`.
+
+    If the whole function already fits, returns `[code]`. Otherwise each chunk
+    keeps the function signature plus a contiguous slice of body lines (with
+    `// ...` where lines were elided), advancing with ~`overlap_ratio` overlap
+    so patterns near chunk boundaries are not split.
+    """
+    if fits(wrap(code)):
+        return [code]
+    lines = code.splitlines()
+    sig = signature_lines(lines)
+    if sig >= len(lines):
+        return [code]
+
+    sig_idx = list(range(sig))
+    chunks: list[str] = []
+    pos = sig
+    while pos < len(lines):
+        # Binary search for the largest `end` in [pos + 1, len(lines)] that fits.
+        lo, hi = pos + 1, len(lines)
+        if not fits(wrap(render(lines, [*sig_idx, pos]))):
+            end = pos + 1  # single line overflows: emit it and let the embedder trim the tail
+        elif fits(wrap(render(lines, [*sig_idx, *range(pos, hi)]))):
+            end = hi
+        else:
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                if fits(wrap(render(lines, [*sig_idx, *range(pos, mid)]))):
+                    lo = mid
+                else:
+                    hi = mid
+            end = lo
+        chunks.append(render(lines, [*sig_idx, *range(pos, end)]))
+        if end >= len(lines):
+            break
+        span = end - pos
+        step = max(1, span - int(span * overlap_ratio))
+        pos += step
+    return chunks

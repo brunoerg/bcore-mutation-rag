@@ -1,5 +1,5 @@
-from mutant_rag.chunking import ELISION, changed_lines, compact_diff, focus_code, signature_lines
-from mutant_rag.embedding import TextBudget, query_text, record_text
+from mutant_rag.chunking import ELISION, changed_lines, chunk_code, compact_diff, focus_code, signature_lines
+from mutant_rag.embedding import TextBudget, query_text, query_texts, record_text
 from mutant_rag.mining import function_diff
 from mutant_rag.records import BugRecord
 
@@ -117,3 +117,60 @@ def test_record_text_drops_removed_lines_when_diff_is_too_long():
     diff_part = text.split("// diff:\n", 1)[1]
     assert "+    if (x <= limit) return;" in diff_part
     assert not any(l.startswith("-") for l in diff_part.splitlines())
+
+
+def test_signature_lines_multiline():
+    sig = [
+        "template <typename T>",
+        "bool Chainstate::ConnectBlock(",
+        "    const CBlock& block,",
+        "    BlockValidationState& state,",
+        "    CBlockIndex* pindex)",
+        "    EXCLUSIVE_LOCKS_REQUIRED(cs_main)",
+        "{",
+        "    return true;",
+        "}",
+    ]
+    assert signature_lines(sig) == 7
+
+
+def test_chunk_code_short_is_single_chunk():
+    code = long_function(5, 2)
+    assert chunk_code(code, char_budget(10_000).fits) == [code]
+
+
+def test_chunk_code_long_covers_all_lines_with_overlap():
+    code = long_function(80, 65)
+    chunks = chunk_code(code, char_budget(350).fits)
+    assert len(chunks) > 2
+    for ch in chunks:
+        assert len(ch) <= 350
+        lines = ch.splitlines()
+        assert lines[0] == "bool Check(int x, int limit)" and lines[1] == "{"
+    # Every line in the function appears in at least one chunk.
+    seen = {l for ch in chunks for l in ch.splitlines()}
+    for line in code.splitlines():
+        assert line in seen
+    # Consecutive chunks overlap on at least one body line.
+    for a, b in zip(chunks, chunks[1:]):
+        body_a = {l for l in a.splitlines()[2:] if l != ELISION}
+        body_b = {l for l in b.splitlines()[2:] if l != ELISION}
+        assert body_a & body_b
+
+
+def test_chunk_code_single_huge_line_makes_progress():
+    code = "void f() {\n" + ("    " + "x" * 500 + ";\n") + "    return;\n}\n"
+    chunks = chunk_code(code, char_budget(100).fits)
+    assert len(chunks) >= 2
+    assert any("return;" in ch for ch in chunks)
+
+
+def test_query_texts_chunks_without_focus_and_focuses_with_line():
+    code = long_function(120, 100)
+    bug_line = code.splitlines().index("    if (x < limit) return;")
+    chunks = query_texts(code, "Check", "validation", budget=char_budget(400))
+    assert len(chunks) > 1
+    assert all(len(c) <= 400 and c.startswith("// subsystem: validation\n// function: Check\n") for c in chunks)
+    assert any("if (x < limit) return;" in c for c in chunks)
+    focused = query_texts(code, "Check", "validation", focus_line=bug_line, budget=char_budget(400))
+    assert len(focused) == 1 and "if (x < limit) return;" in focused[0]

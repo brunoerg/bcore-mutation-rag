@@ -4,7 +4,7 @@ import json
 import numpy as np
 import pytest
 
-from mutant_rag.embedding import HashingEmbedder
+from mutant_rag.embedding import HashingEmbedder, TextBudget
 from mutant_rag.index import MANIFEST_FILE, BugIndex, IndexMismatchError
 from mutant_rag.records import CONFIRMED, BugRecord, load_records, merge_records, write_jsonl
 from mutant_rag.retrieval import Query, RetrievalFilter, Retriever
@@ -160,3 +160,53 @@ def test_hashing_embedder_normalized_and_deterministic(embedder):
     assert np.allclose(np.linalg.norm(v[:2], axis=1), 1.0)
     assert np.array_equal(v[0], v[1])
     assert not v[2].any()
+
+
+def test_long_query_multichunk_retrieves_tail_match():
+    class TruncatingEmbedder(HashingEmbedder):
+        def __init__(self, dim: int = 256, max_chars: int = 320):
+            super().__init__(dim)
+            self.max_chars = max_chars
+
+        def text_budget(self) -> TextBudget:
+            return TextBudget(len, self.max_chars)
+
+        def encode(self, texts):
+            return super().encode([t[: self.max_chars] for t in texts])
+
+    emb = TruncatingEmbedder()
+    target_bug = BugRecord(
+        id="tail:src/validation.cpp:VerifyFee",
+        commit_sha="a" * 40,
+        file_path="src/validation.cpp",
+        function_name="VerifyFee",
+        commit_message="Fix overflow in fee multiplier",
+        buggy_code="bool VerifyFee() {\n    CAmount fee = nSize * feerate_sat_per_kvb;\n    if (!MoneyRange(fee)) return false;\n}\n",
+        fixed_code="bool VerifyFee() {\n    CAmount fee = GetFee(nSize);\n    if (!MoneyRange(fee)) return false;\n}\n",
+        diff="-    CAmount fee = nSize * feerate_sat_per_kvb;\n+    CAmount fee = GetFee(nSize);\n",
+        subsystem="validation",
+        label=CONFIRMED,
+    )
+    distractor = BugRecord(
+        id="head:src/net.cpp:ProcessMessage",
+        commit_sha="b" * 40,
+        file_path="src/net.cpp",
+        function_name="ProcessMessage",
+        commit_message="Fix peer ban score",
+        buggy_code="void ProcessMessage() {\n    placeholder_setup_step_0();\n    placeholder_setup_step_1();\n}\n",
+        fixed_code="void ProcessMessage() {\n    placeholder_setup_step_0();\n}\n",
+        diff="-    placeholder_setup_step_1();\n",
+        subsystem="net",
+        label=CONFIRMED,
+    )
+    idx = BugIndex.create(emb)
+    idx.upsert([distractor, target_bug], emb)
+
+    # Target function has unrelated setup at the top and the fee-overflow pattern at the tail.
+    body = [f"    placeholder_setup_step_{i}();" for i in range(60)]
+    body[55] = "    CAmount fee = nSize * feerate_sat_per_kvb;"
+    body[56] = "    if (!MoneyRange(fee)) return false;"
+    long_target = "bool ProcessTx()\n{\n" + "\n".join(body) + "\n}\n"
+
+    res = Retriever(idx, emb).search(Query(long_target, "ProcessTx", "validation"), top_k=2)
+    assert res[0].record.id == target_bug.id

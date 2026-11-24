@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol, Sequence
 
-from .embedding import Embedder, query_text, text_budget
+from .embedding import Embedder, query_texts, text_budget
 from .index import BugIndex
 from .records import BugRecord
 
@@ -98,16 +98,21 @@ class Retriever:
 
     def search(self, query: Query, top_k: int = 5, flt: RetrievalFilter | None = None) -> list[RetrievedBug]:
         flt = flt or RetrievalFilter()
-        qvec = self.embedder.encode([query_text(query.code, query.function_name, query.subsystem,
-                                                query.focus_line, text_budget(self.embedder))])
+        texts = query_texts(query.code, query.function_name, query.subsystem,
+                            query.focus_line, text_budget(self.embedder))
+        qvecs = self.embedder.encode(texts)
         # A flat index is exact, so when filtering we can afford to score everything;
         # this guarantees filtered results are the true top-k within the subset.
         n = len(self.index) if (flt.is_active() or self.rerankers) else top_k * self.oversample
-        cands = [
-            RetrievedBug(e.record, s, {"dense": s})
-            for e, s in self.index.search_vectors(qvec[0], max(n, top_k))
-            if flt(e.record)
-        ]
+        best: dict[str, tuple[BugRecord, float]] = {}
+        for qvec in qvecs:
+            for e, s in self.index.search_vectors(qvec, max(n, top_k)):
+                if not flt(e.record):
+                    continue
+                prev = best.get(e.record.id)
+                if prev is None or s > prev[1]:
+                    best[e.record.id] = (e.record, s)
+        cands = [RetrievedBug(rec, s, {"dense": s}) for rec, s in best.values()]
         for rr in self.rerankers:
             cands = rr.rerank(query, cands)
         cands.sort(key=lambda c: (-c.score, c.record.id))  # deterministic tie-breaking
