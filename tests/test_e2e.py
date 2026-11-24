@@ -80,10 +80,10 @@ def test_end_to_end(tmp_path, make_repo, fake_claude, capsys):
     assert [m["status"] for m in doc["mutants"]] == ["candidate", "candidate"]
     assert doc["target"]["repo_relpath"] == "src/txmempool.cpp"
     assert doc["target"]["base_commit"] == git(repo, "rev-parse", "HEAD").strip()
-    assert doc["generation"]["claude_cli_version"].startswith("9.9.9")
+    assert doc["generation"]["llm_cli_version"].startswith("9.9.9")
     assert doc["retrieval"][0]["commit_sha"] == doc["mutants"][0]["historical_commits"][0]
     gen_run = next(p for p in (tmp_path / "runs").iterdir() if "_generate_" in p.name)
-    for f in ("run.json", "prompt.txt", "retrieval.json", "target.json", "claude_response.json",
+    for f in ("run.json", "prompt.txt", "retrieval.json", "target.json", "llm_response.json",
               "generation_meta.json", "mutants.json"):
         assert (gen_run / f).exists(), f
     assert (gen_run / "prompt.txt").read_text() == fake_claude.last_call()["prompt"]
