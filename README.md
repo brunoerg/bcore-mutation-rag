@@ -78,9 +78,14 @@ python -m mutant_rag index --triage-min-confidence 0.8  # + unreviewed records C
 python -m mutant_rag search --file ~/src/bitcoin/src/txmempool.cpp --function TrimToSize --top-k 5 \
        [--subsystem mempool --subsystem validation] [--exclude-commit <sha>]
 
+# 5b. (Optional) Discover and summarize existing tests covering the target function
+python -m mutant_rag discover-tests --file ~/src/bitcoin/src/txmempool.cpp --function TrimToSize \
+       [--method agent|static] [--coverage lcov.info] --out test_context.json
+
 # 6. Generate mutants (calls the agent CLI; nothing in the repo is modified)
 python -m mutant_rag generate --file ~/src/bitcoin/src/txmempool.cpp --function TrimToSize \
-       --top-k 5 --n-mutants 5 [--backend opencode --model provider/model] [--dry-run] --out mutants.json
+       --top-k 5 --n-mutants 5 [--test-context test_context.json] \
+       [--backend opencode --model provider/model] [--dry-run] --out mutants.json
 
 # 7. Validate in temporary worktrees
 python -m mutant_rag validate --input mutants.json \
@@ -326,6 +331,7 @@ mutant_rag/
   index.py       FAISS index + metadata + manifest, incremental upsert
   retrieval.py   Retriever, filters, Reranker protocol
   target.py      target function loading (repo/relpath/subsystem detection)
+  test_context.py test discovery (read-only agent / static grep / LCOV) & prompt summary
   llm.py         backend-neutral LLM client base, errors, JSON/schema helpers
   claude_cli.py  `claude -p` backend
   codex_cli.py   `codex exec` backend

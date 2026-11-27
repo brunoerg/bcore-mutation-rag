@@ -27,35 +27,49 @@ import subprocess
 from .llm import CLIClient, LLMResponse, check_schema, extract_json, schema_instructions
 
 AGENT = "mutant-rag"
+READONLY_AGENT = "mutant-rag-readonly"
 DEFAULT_SYSTEM = "You are a precise assistant. You never use tools and answer with JSON only."
+DEFAULT_READONLY_SYSTEM = "You are a precise code-analysis assistant. Only read/search files and answer with JSON only."
 
 
 class OpenCodeClient(CLIClient):
     name = "opencode"
 
-    def build_argv(self) -> list[str]:
+    def build_argv(self, *, readonly_tools: bool = False) -> list[str]:
         c = self.config
-        argv = [c.binary, "run", "--format", "json", "--pure", "--agent", AGENT, "--title", AGENT]
+        agent = READONLY_AGENT if readonly_tools else AGENT
+        argv = [c.binary, "run", "--format", "json", "--pure", "--agent", agent, "--title", agent]
         if c.model:
             argv += ["--model", c.model]
         if c.effort:
             argv += ["--variant", c.effort]
         return argv + list(c.extra_args)
 
-    def agent_config(self, system_prompt: str | None) -> dict:
+    def agent_config(self, system_prompt: str | None, *, readonly_tools: bool = False) -> dict:
+        if readonly_tools:
+            return {
+                "mode": "primary",
+                "description": "mutant_rag read-only repository analyzer",
+                "prompt": system_prompt or DEFAULT_READONLY_SYSTEM,
+                "tools": {"*": False, "read": True, "grep": True, "glob": True, "list": True},
+                "permission": {"*": "deny", "read": "allow", "grep": "allow", "glob": "allow", "list": "allow"},
+            }
         return {"mode": "primary", "description": "mutant_rag JSON oracle (no tools)",
                 "prompt": system_prompt or DEFAULT_SYSTEM,
                 "tools": {"*": False}, "permission": {"*": "deny"}}
 
-    def prepare(self, sandbox, prompt, json_schema, system_prompt):
+    def prepare(self, sandbox, prompt, json_schema, system_prompt, *, readonly_cwd=None):
+        readonly_tools = readonly_cwd is not None
+        agent = READONLY_AGENT if readonly_tools else AGENT
         env = self._env()
         try:
             cfg = json.loads(env.get("OPENCODE_CONFIG_CONTENT") or "{}")
         except json.JSONDecodeError:
             cfg = {}
-        cfg.setdefault("agent", {})[AGENT] = self.agent_config(system_prompt)
+        cfg.setdefault("agent", {})[agent] = self.agent_config(system_prompt, readonly_tools=readonly_tools)
         env["OPENCODE_CONFIG_CONTENT"] = json.dumps(cfg)
-        return self.build_argv(), f"{prompt}\n\n{schema_instructions(json_schema)}\n", env
+        return (self.build_argv(readonly_tools=readonly_tools),
+                f"{prompt}\n\n{schema_instructions(json_schema)}\n", env)
 
     def hint(self, proc):
         if proc is None:

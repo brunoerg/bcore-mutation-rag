@@ -107,7 +107,7 @@ def test_module_entrypoint():
     out = subprocess.run([sys.executable, "-m", "mutant_rag", "--help"], capture_output=True, text=True,
                          cwd=os.path.dirname(os.path.dirname(__file__)))
     assert out.returncode == 0
-    for cmd in ("mine", "label", "index", "search", "generate", "validate"):
+    for cmd in ("mine", "label", "index", "discover-tests", "search", "generate", "validate"):
         assert cmd in out.stdout
 
 

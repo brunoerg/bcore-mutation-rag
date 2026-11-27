@@ -8,6 +8,7 @@ that the edit lies inside the target function, and lets us measure locality.
 
 from __future__ import annotations
 
+import copy
 import difflib
 import hashlib
 import re
@@ -16,9 +17,11 @@ from dataclasses import asdict, dataclass, field
 from .llm import CLIClient
 from .retrieval import RetrievedBug
 from .target import Target
+from .test_context import DEFAULT_MAX_PROMPT_CHARS, format_test_context_prompt
 
-PROMPT_VERSION = 3
+PROMPT_VERSION = 4
 MAX_EXAMPLE_DIFF_CHARS = 3000
+MAX_TEST_CONTEXT_CHARS = DEFAULT_MAX_PROMPT_CHARS
 
 SYSTEM_PROMPT = """\
 You are a mutation-testing assistant for Bitcoin Core (C++). You generate realistic \
@@ -52,7 +55,34 @@ MUTANT_SCHEMA = {
 }
 
 
-def build_prompt(target: Target, examples: list[RetrievedBug], n_mutants: int, max_changed_lines: int) -> str:
+def mutant_schema(with_test_context: bool = False) -> dict:
+    """Return the JSON Schema for mutant generation, adding gap justification when test context is used."""
+    if not with_test_context:
+        return MUTANT_SCHEMA
+    schema = copy.deepcopy(MUTANT_SCHEMA)
+    item = schema["properties"]["mutants"]["items"]
+    item["required"] = list(item["required"]) + ["why_existing_tests_may_miss"]
+    item["properties"]["why_existing_tests_may_miss"] = {
+        "type": "string",
+        "description": (
+            "Briefly explain why the summarized existing tests may not catch this fault, "
+            "and name a concrete reachable input and assertion that WOULD kill it."
+        ),
+    }
+    return schema
+
+
+def build_prompt(target: Target, examples: list[RetrievedBug], n_mutants: int, max_changed_lines: int,
+                 test_context: dict | None = None) -> str:
+    req7 = (
+        "7. Test-gap focus: an EXISTING TEST COVERAGE summary is provided below. Prefer "
+        "historical-bug-analogous faults targeting untested edge cases, unchecked invariants, "
+        "or weakly asserted paths rather than faults trivially caught by an explicit existing assertion. "
+        "Do NOT evade tests with equivalent, unreachable, or unobservable edits — in "
+        "`why_existing_tests_may_miss`, explain both why current tests may miss the fault and what "
+        "concrete reachable input and assertion WOULD catch it.\n"
+        if test_context is not None else ""
+    )
     parts = [
         f"# Task\n\nGenerate up to {n_mutants} distinct mutants of the TARGET FUNCTION below, "
         "each inspired by one or more of the HISTORICAL BUG FIXES. Each historical fix shows the "
@@ -75,7 +105,8 @@ def build_prompt(target: Target, examples: list[RetrievedBug], n_mutants: int, m
         "`explanation`.\n"
         "6. Prefer realistic faults (boundary conditions, missing checks, wrong operator, wrong variable, "
         "missing lock, incorrect state update, integer overflow) over arbitrary changes. Do not output "
-        "duplicate mutants.\n",
+        "duplicate mutants.\n"
+        + req7,
         "# Historical bug fixes\n",
     ]
     for ex in examples:
@@ -87,6 +118,8 @@ def build_prompt(target: Target, examples: list[RetrievedBug], n_mutants: int, m
             f"- subsystem: {r.subsystem}\n- commit message: {r.subject}\n\n"
             f"```diff\n{diff.rstrip()}\n```\n"
         )
+    if test_context is not None:
+        parts.append(format_test_context_prompt(test_context, max_chars=MAX_TEST_CONTEXT_CHARS))
     parts.append(
         f"# Target function\n\nFile: {target.repo_relpath} (subsystem: {target.subsystem})\n\n"
         f"```cpp\n{target.code}\n```\n"
@@ -106,6 +139,7 @@ class Mutant:
     explanation: str = ""
     bug_pattern: str = ""
     expected_behavior_change: str = ""
+    why_existing_tests_may_miss: str = ""
     historical_bug_ids: list[str] = field(default_factory=list)
     historical_commits: list[str] = field(default_factory=list)
     unknown_bug_ids: list[str] = field(default_factory=list)
@@ -198,6 +232,7 @@ def postprocess(raw_mutants: list[dict], target: Target, examples: list[Retrieve
             original_snippet=rm.get("original_snippet", ""), mutated_snippet=rm.get("mutated_snippet", ""),
             explanation=rm.get("explanation", ""), bug_pattern=rm.get("bug_pattern", ""),
             expected_behavior_change=rm.get("expected_behavior_change", ""),
+            why_existing_tests_may_miss=str(rm.get("why_existing_tests_may_miss", "")),
             historical_bug_ids=[resolve_bug_id(str(b), known) for b in rm.get("historical_bug_ids", [])],
         )
         m.historical_commits = [known[b] for b in m.historical_bug_ids if b in known]
@@ -303,8 +338,10 @@ class GenerationResult:
 
 
 def generate(target: Target, examples: list[RetrievedBug], client: CLIClient,
-             n_mutants: int = 5, max_changed_lines: int = 3) -> GenerationResult:
-    prompt = build_prompt(target, examples, n_mutants, max_changed_lines)
-    resp = client.run_json(prompt, MUTANT_SCHEMA, system_prompt=SYSTEM_PROMPT)
+             n_mutants: int = 5, max_changed_lines: int = 3,
+             test_context: dict | None = None) -> GenerationResult:
+    prompt = build_prompt(target, examples, n_mutants, max_changed_lines, test_context=test_context)
+    schema = mutant_schema(with_test_context=test_context is not None)
+    resp = client.run_json(prompt, schema, system_prompt=SYSTEM_PROMPT)
     raw = resp.structured.get("mutants", []) if isinstance(resp.structured, dict) else []
     return GenerationResult(prompt, postprocess(raw, target, examples, max_changed_lines), resp.to_dict())

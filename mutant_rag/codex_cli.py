@@ -30,7 +30,7 @@ class CodexClient(CLIClient):
     name = "codex"
     api_key_env = ("OPENAI_API_KEY", "CODEX_API_KEY")
 
-    def build_argv(self, sandbox: str, schema_path: str) -> list[str]:
+    def build_argv(self, sandbox: str, schema_path: str, *, readonly_cwd: str | None = None) -> list[str]:
         c = self.config
         argv = [
             c.binary, "exec",
@@ -38,10 +38,13 @@ class CodexClient(CLIClient):
             "--ephemeral",
             "--skip-git-repo-check",
             "--sandbox", "read-only",
-            "--disable", "shell_tool",
+        ]
+        if readonly_cwd is None:
+            argv += ["--disable", "shell_tool"]
+        argv += [
             "-c", 'web_search="disabled"',
             "-c", "mcp_servers={}",
-            "-C", sandbox,
+            "-C", readonly_cwd or sandbox,
             "--output-schema", schema_path,
         ]
         if c.model:
@@ -50,12 +53,12 @@ class CodexClient(CLIClient):
             argv += ["-c", f"model_reasoning_effort={json.dumps(c.effort)}"]
         return argv + list(c.extra_args) + ["-"]
 
-    def prepare(self, sandbox, prompt, json_schema, system_prompt):
+    def prepare(self, sandbox, prompt, json_schema, system_prompt, *, readonly_cwd=None):
         schema_path = os.path.join(sandbox, "output_schema.json")
         with open(schema_path, "w") as fh:
             json.dump(json_schema, fh)
         text = f"{system_prompt}\n\n---\n\n{prompt}" if system_prompt else prompt
-        return self.build_argv(sandbox, schema_path), text, self._env()
+        return self.build_argv(sandbox, schema_path, readonly_cwd=readonly_cwd), text, self._env()
 
     def hint(self, proc):
         resolved = os.path.realpath(shutil.which(self.config.binary) or self.config.binary)
