@@ -199,7 +199,123 @@ def cmd_triage(args) -> int:
     return 1 if summary["failed_batches"] == len(outcomes) else 0
 
 
-# ---- search / generate ----------------------------------------------------
+# ---- discover-tests / search / generate ------------------------------------
+
+def _target_metadata(target) -> dict:
+    base_commit = prov.git_head(target.repo) if target.repo else None
+    dirty = False
+    if target.repo:
+        st = subprocess.run(["git", "-C", str(target.repo), "status", "--porcelain", "--", target.repo_relpath],
+                            capture_output=True, text=True)
+        dirty = bool(st.stdout.strip())
+    if dirty:
+        _eprint(f"warning: {target.repo_relpath} has uncommitted changes; patches are computed against the "
+                f"working file and may not apply to base commit {base_commit[:12] if base_commit else '?'}")
+    return dict(target.to_dict(), base_commit=base_commit, file_dirty=dirty)
+
+
+def cmd_discover_tests(args) -> int:
+    from .llm import LLMError, make_client
+    from .target import load_target
+    from .test_context import (
+        AGENT_SYSTEM_PROMPT,
+        STATIC_SYSTEM_PROMPT,
+        TEST_CONTEXT_LLM_SCHEMA,
+        TEST_CONTEXT_PROMPT_VERSION,
+        TEST_CONTEXT_SCHEMA_VERSION,
+        build_discovery_prompt,
+        discover_tests,
+        empty_line_coverage,
+        gather_static_test_snippets,
+        parse_lcov,
+    )
+
+    target = load_target(args.file, args.function, args.line, args.repo)
+    if args.method == "agent" and target.repo is None:
+        _eprint("agent test discovery requires the target file to be inside a git repository "
+                "(pass --repo or use --method static)")
+        return 2
+    rec = _start_run(args, "discover_tests")
+    tdict = _target_metadata(target)
+    rec.save_json("target.json", tdict)
+
+    cfg = _llm_config(args)
+    client = make_client(cfg)
+    sys_prompt = AGENT_SYSTEM_PROMPT if args.method == "agent" else STATIC_SYSTEM_PROMPT
+    meta = {
+        "prompt_version": TEST_CONTEXT_PROMPT_VERSION,
+        "method": args.method,
+        "coverage": args.coverage,
+        "max_static_chars": args.max_static_chars,
+        "llm_config": cfg.to_dict(),
+        "llm_cli_version": client.version(),
+        "system_prompt": sys_prompt,
+        "json_schema": TEST_CONTEXT_LLM_SCHEMA,
+        "seed": args.seed,
+    }
+    if args.dry_run:
+        cov = parse_lcov(args.coverage, target) if args.coverage else empty_line_coverage()
+        snippets = gather_static_test_snippets(target, max_chars=args.max_static_chars) if args.method == "static" else []
+        prompt = build_discovery_prompt(target, args.method, line_coverage=cov, static_snippets=snippets)
+        rec.save_text("prompt.txt", prompt)
+        if args.method == "static":
+            rec.save_json("static_snippets.json", snippets)
+        rec.save_json("discover_tests_meta.json", meta)
+        _finish_run(rec, dry_run=True)
+        print(f"dry run: prompt saved to {rec.path('prompt.txt')}")
+        return 0
+
+    try:
+        res = discover_tests(target, client, method=args.method, coverage_path=args.coverage,
+                             max_static_chars=args.max_static_chars)
+    except LLMError as e:
+        rec.save_json("llm_error.json", {"error": str(e), "type": type(e).__name__, "returncode": e.returncode,
+                                         "stdout": e.stdout[-20000:], "stderr": e.stderr[-20000:]})
+        _finish_run(rec, error=str(e))
+        _eprint(f"test discovery failed: {e} (details in {rec.dir})")
+        return 1
+
+    rec.save_text("prompt.txt", res.prompt)
+    rec.save_json("llm_response.json", res.response)
+    if args.method == "static":
+        rec.save_json("static_snippets.json", res.static_snippets)
+    meta.update(
+        prompt_sha256=prov.sha256_text(res.prompt),
+        models_used=res.response["models_used"],
+        duration_s=res.response["duration_s"],
+        argv=res.response["argv"],
+        repo_unchanged=res.repo_unchanged,
+    )
+    rec.save_json("discover_tests_meta.json", meta)
+
+    doc = {
+        "schema_version": TEST_CONTEXT_SCHEMA_VERSION,
+        "run_id": rec.run_id,
+        "created_at": _now(),
+        "method": res.method,
+        "target": {k: tdict[k] for k in ("repo", "repo_relpath", "function_name", "start_line",
+                                         "end_line", "subsystem", "code_sha256", "base_commit") if k in tdict},
+        "tests": res.tests,
+        "line_coverage": res.line_coverage,
+        "observed_gaps": res.observed_gaps,
+        "suggested_test_cmds": res.suggested_test_cmds,
+    }
+    rec.save_json("test_context.json", doc)
+    if args.out:
+        Path(args.out).write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+    _finish_run(rec, repo_unchanged=res.repo_unchanged)
+    if res.repo_unchanged is False:
+        _eprint("WARNING: repository checkout changed during agent test discovery")
+    print(f"discovered {len(res.tests)} tests, {len(res.observed_gaps)} gaps -> "
+          f"{args.out or rec.path('test_context.json')}")
+    for t in res.tests:
+        print(f"  [{t['kind']}] {t['path']}" + (f" :: {t['test_name']}" if t.get("test_name") else ""))
+    if res.suggested_test_cmds:
+        print("suggested test cmds:")
+        for cmd in res.suggested_test_cmds:
+            print(f"  {cmd}")
+    return 0
+
 
 def _retrieve(args, rec: prov.RunRecorder):
     from .embedding import make_embedder
@@ -216,16 +332,7 @@ def _retrieve(args, rec: prov.RunRecorder):
     focus_line = args.line - target.start_line if args.line else None
     results = retriever.search(Query(target.code, target.function_name, target.subsystem, focus_line),
                                args.top_k, flt)
-    base_commit = prov.git_head(target.repo) if target.repo else None
-    dirty = False
-    if target.repo:
-        st = subprocess.run(["git", "-C", str(target.repo), "status", "--porcelain", "--", target.repo_relpath],
-                            capture_output=True, text=True)
-        dirty = bool(st.stdout.strip())
-    tdict = dict(target.to_dict(), base_commit=base_commit, file_dirty=dirty)
-    if dirty:
-        _eprint(f"warning: {target.repo_relpath} has uncommitted changes; patches are computed against the "
-                f"working file and may not apply to base commit {base_commit[:12] if base_commit else '?'}")
+    tdict = _target_metadata(target)
     rec.save_json("target.json", tdict)
     rec.save_json("retrieval.json", {
         "index_dir": str(Path(args.index_dir).resolve()), "index_manifest": idx.manifest(),
@@ -255,7 +362,8 @@ def cmd_search(args) -> int:
 
 def cmd_generate(args) -> int:
     from .llm import LLMError, make_client
-    from .generation import MUTANT_SCHEMA, PROMPT_VERSION, SYSTEM_PROMPT, build_prompt, generate
+    from .generation import PROMPT_VERSION, SYSTEM_PROMPT, build_prompt, generate, mutant_schema
+    from .test_context import check_target_match, load_test_context
 
     rec = _start_run(args, "generate")
     target, tdict, results = _retrieve(args, rec)
@@ -263,23 +371,50 @@ def cmd_generate(args) -> int:
     if not results:
         _eprint("no historical bugs retrieved; is the index empty or the filter too strict?")
         return 1
+
+    test_context = None
+    tc_meta: dict | None = None
+    if args.test_context:
+        test_context = load_test_context(args.test_context)
+        mismatches = check_target_match(test_context, target)
+        if mismatches:
+            if not args.allow_stale_test_context:
+                _eprint("test context does not match target:\n  - " + "\n  - ".join(mismatches)
+                        + "\nRe-run `discover-tests` or pass --allow-stale-test-context to override.")
+                _finish_run(rec, error="stale_test_context")
+                return 1
+            _eprint("warning: using stale/mismatched test context: " + "; ".join(mismatches))
+        rec.save_json("test_context.json", test_context)
+        tc_meta = {
+            "path": str(Path(args.test_context).resolve()),
+            "run_id": test_context.get("run_id"),
+            "method": test_context.get("method"),
+            "sha256": prov.sha256_text(json.dumps(test_context, sort_keys=True)),
+            "stale": bool(mismatches),
+            "n_tests": len(test_context.get("tests") or []),
+            "n_gaps": len(test_context.get("observed_gaps") or []),
+        }
+
     cfg = _llm_config(args)
     client = make_client(cfg)
+    schema = mutant_schema(with_test_context=test_context is not None)
     gen_meta = {"prompt_version": PROMPT_VERSION, "n_mutants": args.n_mutants,
                 "max_changed_lines": args.max_changed_lines, "llm_config": cfg.to_dict(),
                 "llm_cli_version": client.version(), "system_prompt": SYSTEM_PROMPT,
-                "json_schema": MUTANT_SCHEMA, "seed": args.seed,
+                "json_schema": schema, "seed": args.seed,
                 "seed_note": "The agent CLIs expose no sampling seed; generation is not bit-reproducible. "
                              "The exact prompt and raw response are saved instead."}
+    if tc_meta is not None:
+        gen_meta["test_context"] = tc_meta
     if args.dry_run:
-        prompt = build_prompt(target, results, args.n_mutants, args.max_changed_lines)
+        prompt = build_prompt(target, results, args.n_mutants, args.max_changed_lines, test_context=test_context)
         rec.save_text("prompt.txt", prompt)
         rec.save_json("generation_meta.json", gen_meta)
         _finish_run(rec, dry_run=True)
         print(f"dry run: prompt saved to {rec.path('prompt.txt')}")
         return 0
     try:
-        gen = generate(target, results, client, args.n_mutants, args.max_changed_lines)
+        gen = generate(target, results, client, args.n_mutants, args.max_changed_lines, test_context=test_context)
     except LLMError as e:
         rec.save_json("llm_error.json", {"error": str(e), "type": type(e).__name__, "returncode": e.returncode,
                                             "stdout": e.stdout[-20000:], "stderr": e.stderr[-20000:]})
@@ -298,6 +433,8 @@ def cmd_generate(args) -> int:
         "generation": {k: v for k, v in gen_meta.items() if k not in ("json_schema", "system_prompt")},
         "mutants": [m.to_dict() for m in gen.mutants],
     }
+    if tc_meta is not None:
+        doc["test_context"] = tc_meta
     rec.save_json("mutants.json", doc)
     for m in gen.mutants:
         if m.patch:
@@ -441,6 +578,23 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--index-dir", default=DEFAULT_INDEX)
         sp.add_argument("--embedder", help="override the embedder recorded in the index manifest")
 
+    dt = sub.add_parser("discover-tests", parents=[common],
+                        help="find and summarize existing tests covering a target function")
+    dt.add_argument("--file", required=True, help="C++ file containing the target function")
+    dt.add_argument("--function", help="function name inside --file")
+    dt.add_argument("--line", type=int, help="any line inside the target function")
+    dt.add_argument("--repo", help="repository the file belongs to (default: auto-detect)")
+    dt.add_argument("--method", choices=["agent", "static"], default="agent",
+                    help="agent: read-only agent CLI searches the repo (default); "
+                         "static: deterministic grep + tool-less LLM summary")
+    dt.add_argument("--coverage", help="optional lcov.info file for exact covered/uncovered lines")
+    dt.add_argument("--max-static-chars", type=int, default=24000,
+                    help="character budget for gathered test excerpts in --method static")
+    llm_args(dt)
+    dt.add_argument("--out", help="also write test_context JSON here")
+    dt.add_argument("--dry-run", action="store_true", help="build and save the prompt without calling the LLM")
+    dt.set_defaults(func=cmd_discover_tests)
+
     s = sub.add_parser("search", parents=[common], help="retrieve historical bugs similar to a function")
     target_args(s)
     s.add_argument("--json", action="store_true")
@@ -450,6 +604,9 @@ def build_parser() -> argparse.ArgumentParser:
     target_args(g)
     g.add_argument("--n-mutants", type=int, default=5)
     g.add_argument("--max-changed-lines", type=int, default=3)
+    g.add_argument("--test-context", help="path to test_context.json from `discover-tests` to focus mutants on test gaps")
+    g.add_argument("--allow-stale-test-context", action="store_true",
+                   help="allow using a test context whose target function or code SHA does not match")
     llm_args(g)
     g.add_argument("--out", help="also write mutants JSON here")
     g.add_argument("--dry-run", action="store_true", help="build and save the prompt without calling the LLM")

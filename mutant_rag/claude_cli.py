@@ -31,17 +31,26 @@ def ClaudeConfig(**kw) -> LLMConfig:  # noqa: N802 - kept for callers/tests
     return LLMConfig(backend="claude", **kw)
 
 
+READONLY_TOOLS = "Read,Grep,Glob"
+
+
 class ClaudeCodeClient(CLIClient):
     name = "claude"
     api_key_env = ("ANTHROPIC_API_KEY",)
 
-    def build_argv(self, json_schema: dict, system_prompt: str | None = None) -> list[str]:
+    def build_argv(self, json_schema: dict, system_prompt: str | None = None,
+                   *, readonly_tools: bool = False) -> list[str]:
         c = self.config
         argv = [
             c.binary, "-p",
             "--output-format", "json",
             "--json-schema", json.dumps(json_schema, separators=(",", ":")),
-            "--tools", "",
+        ]
+        if readonly_tools:
+            argv += ["--tools", READONLY_TOOLS, "--allowedTools", READONLY_TOOLS]
+        else:
+            argv += ["--tools", ""]
+        argv += [
             "--strict-mcp-config",
             "--disable-slash-commands",
             "--no-session-persistence",
@@ -56,8 +65,8 @@ class ClaudeCodeClient(CLIClient):
             argv += ["--append-system-prompt", system_prompt]
         return argv + list(c.extra_args)
 
-    def prepare(self, sandbox, prompt, json_schema, system_prompt):
-        return self.build_argv(json_schema, system_prompt), prompt, self._env()
+    def prepare(self, sandbox, prompt, json_schema, system_prompt, *, readonly_cwd=None):
+        return self.build_argv(json_schema, system_prompt, readonly_tools=readonly_cwd is not None), prompt, self._env()
 
     def parse(self, proc: subprocess.CompletedProcess, argv: list[str], duration: float,
               json_schema: dict) -> LLMResponse:

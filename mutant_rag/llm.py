@@ -27,6 +27,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 BACKENDS = ("claude", "codex", "opencode")
@@ -96,7 +97,7 @@ class CLIClient:
     # -- subclass hooks -------------------------------------------------------
 
     def prepare(self, sandbox: str, prompt: str, json_schema: dict,
-                system_prompt: str | None) -> tuple[list[str], str, dict[str, str]]:
+                system_prompt: str | None, *, readonly_cwd: str | None = None) -> tuple[list[str], str, dict[str, str]]:
         """Return (argv, stdin text, env) for one call. `sandbox` is the empty cwd."""
         raise NotImplementedError
 
@@ -125,13 +126,20 @@ class CLIClient:
         except (OSError, subprocess.TimeoutExpired) as e:
             return f"unavailable ({e})"
 
-    def run_json(self, prompt: str, json_schema: dict, system_prompt: str | None = None) -> LLMResponse:
+    def run_json(self, prompt: str, json_schema: dict, system_prompt: str | None = None,
+                 *, readonly_cwd: str | Path | None = None) -> LLMResponse:
         if shutil.which(self.config.binary) is None and not os.path.exists(self.config.binary):
             raise LLMNotFoundError(f"{self.name} CLI not found: {self.config.binary!r}")
+        rcwd: str | None = None
+        if readonly_cwd is not None:
+            resolved = Path(readonly_cwd).resolve()
+            if not resolved.is_dir():
+                raise ValueError(f"readonly_cwd is not a directory: {readonly_cwd}")
+            rcwd = str(resolved)
         start = time.monotonic()
         with tempfile.TemporaryDirectory(prefix=f"mutant_rag_{self.name}_") as sandbox:
-            argv, stdin, env = self.prepare(sandbox, prompt, json_schema, system_prompt)
-            proc = self._exec(argv, stdin, sandbox, env)
+            argv, stdin, env = self.prepare(sandbox, prompt, json_schema, system_prompt, readonly_cwd=rcwd)
+            proc = self._exec(argv, stdin, rcwd or sandbox, env)
         return self.parse(proc, argv, time.monotonic() - start, json_schema)
 
     def _exec(self, argv: list[str], stdin: str, cwd: str, env: dict[str, str]) -> subprocess.CompletedProcess:
